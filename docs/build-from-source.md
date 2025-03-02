@@ -2,24 +2,42 @@
 
 ## Running the server
 
-Dragonfly runs on linux. We advice running it on linux version 5.11 or later
+Dragonfly runs on linux. We advise running it on linux version 5.11 or later
 but you can also run Dragonfly on older kernels as well.
 
+> :warning: **Dragonfly releases are compiled with LTO (link time optimization)**:
+  Depending on the workload this can notably improve performance. If you want to
+  benchmark Dragonfly or use it in production, you should enable LTO by giving
+  `blaze.sh` the `-DCMAKE_CXX_FLAGS="-flto"` argument.
 
 ## Step 1 - install dependencies
 
 On Debian/Ubuntu:
 
 ```bash
-sudo apt install ninja-build libunwind-dev libboost-fiber-dev libssl-dev \
-     autoconf-archive libtool cmake g++ libzstd-dev
+sudo apt install ninja-build libunwind-dev libboost-context-dev libssl-dev \
+     autoconf-archive libtool cmake g++ bison  zlib1g-dev
 ```
 
 On Fedora:
 
 ```bash
-sudo yum install automake boost-devel g++ git cmake libtool ninja-build libzstd-devel  \
-     openssl-devel libunwind-devel autoconf-archive patch
+sudo dnf install -y automake boost-devel g++ git cmake libtool ninja-build \
+     openssl-devel libunwind-devel autoconf-archive patch bison libstdc++-static
+```
+
+On openSUSE:
+
+```bash
+sudo zypper install automake boost-devel gcc-c++ git cmake libtool ninja \
+     openssl-devel libunwind-devel autoconf-archive patch bison \
+     libboost_context-devel libboost_system-devel
+```
+
+On FreeBSD:
+
+```bash
+pkg install -y git bash cmake ninja libunwind boost-libs autoconf automake libtool gmake bison
 ```
 
 ## Step 2 - clone the project

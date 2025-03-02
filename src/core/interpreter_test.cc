@@ -54,6 +54,16 @@ class TestSerializer : public ObjectExplorer {
     absl::StrAppend(&res, "nil ");
   }
 
+  void OnMapStart(unsigned len) final {
+    absl::StrAppend(&res, "{");
+  }
+
+  void OnMapEnd() final {
+    if (res.back() == ' ')
+      res.pop_back();
+    absl::StrAppend(&res, "} ");
+  }
+
   void OnStatus(std::string_view str) {
     absl::StrAppend(&res, "status(", str, ") ");
   }
@@ -63,6 +73,7 @@ class TestSerializer : public ObjectExplorer {
   }
 };
 
+using SliceSpan = Interpreter::SliceSpan;
 class InterpreterTest : public ::testing::Test {
  protected:
   InterpreterTest() {
@@ -77,21 +88,24 @@ class InterpreterTest : public ::testing::Test {
     CHECK_EQ(0, lua_pcall(lua(), 0, num_results, 0));
   }
 
-  void SetGlobalArray(const char* name, vector<string> vec);
+  void SetGlobalArray(const char* name, const vector<string_view>& vec);
 
+  // returns true if script run successfully.
   bool Execute(string_view script);
 
   Interpreter intptr_;
   TestSerializer ser_;
   string error_;
+  vector<unique_ptr<string>> strings_;
 };
 
-void InterpreterTest::SetGlobalArray(const char* name, vector<string> vec) {
-  vector<MutableSlice> slices(vec.size());
+void InterpreterTest::SetGlobalArray(const char* name, const vector<string_view>& vec) {
+  vector<string_view> slices(vec.size());
   for (size_t i = 0; i < vec.size(); ++i) {
-    slices[i] = MutableSlice{vec[i]};
+    strings_.emplace_back(new string(vec[i]));
+    slices[i] = string_view{*strings_.back()};
   }
-  intptr_.SetGlobalArray(name, MutSliceSpan{slices});
+  intptr_.SetGlobalArray(name, SliceSpan{slices});
 }
 
 bool InterpreterTest::Execute(string_view script) {
@@ -252,10 +266,15 @@ TEST_F(InterpreterTest, Execute) {
 
   EXPECT_TRUE(Execute("return {1,2,3,'ciao', {1,2}}"));
   EXPECT_EQ("[i(1) i(2) i(3) str(ciao) [i(1) i(2)]]", ser_.res);
+
+  EXPECT_TRUE(Execute("return {map={a=1,b=2}}"));
+  EXPECT_THAT(ser_.res, testing::AnyOf("{str(a) i(1) str(b) i(2)}", "{str(b) i(2) str(a) i(1)}"));
 }
 
 TEST_F(InterpreterTest, Call) {
-  auto cb = [](MutSliceSpan span, ObjectExplorer* reply) {
+  auto cb = [](auto ca) {
+    auto* reply = ca.translator;
+    auto span = ca.args;
     CHECK_GE(span.size(), 1u);
     string_view cmd{span[0].data(), span[0].size()};
     if (cmd == "string") {
@@ -274,24 +293,25 @@ TEST_F(InterpreterTest, Call) {
   };
 
   intptr_.SetRedisFunc(cb);
-  ASSERT_TRUE(Execute("local var = redis.call('string'); return {type(var), var}"));
+  ASSERT_TRUE(Execute("local var = redis.pcall('string'); return {type(var), var}"));
   EXPECT_EQ("[str(string) str(foo)]", ser_.res);
 
-  EXPECT_TRUE(Execute("local var = redis.call('double'); return {type(var), var}"));
+  EXPECT_TRUE(Execute("local var = redis.pcall('double'); return {type(var), var}"));
   EXPECT_EQ("[str(number) d(3.1415)]", ser_.res);
 
-  EXPECT_TRUE(Execute("local var = redis.call('int'); return {type(var), var}"));
+  EXPECT_TRUE(Execute("local var = redis.pcall('int'); return {type(var), var}"));
   EXPECT_EQ("[str(number) i(42)]", ser_.res);
 
-  EXPECT_TRUE(Execute("local var = redis.call('err'); return {type(var), var}"));
+  EXPECT_TRUE(Execute("local var = redis.pcall('err'); return {type(var), var}"));
   EXPECT_EQ("[str(table) err(myerr)]", ser_.res);
 
-  EXPECT_TRUE(Execute("local var = redis.call('status'); return {type(var), var}"));
+  EXPECT_TRUE(Execute("local var = redis.pcall('status'); return {type(var), var}"));
   EXPECT_EQ("[str(table) status(mystatus)]", ser_.res);
 }
 
 TEST_F(InterpreterTest, CallArray) {
-  auto cb = [](MutSliceSpan span, ObjectExplorer* reply) {
+  auto cb = [](auto ca) {
+    auto* reply = ca.translator;
     reply->OnArrayStart(2);
     reply->OnArrayStart(1);
     reply->OnArrayStart(2);
@@ -310,11 +330,15 @@ TEST_F(InterpreterTest, CallArray) {
 
 TEST_F(InterpreterTest, ArgKeys) {
   vector<string> vec_arr{};
-  vector<MutableSlice> slices;
+  vector<string_view> slices;
   SetGlobalArray("ARGV", {"foo", "bar"});
   SetGlobalArray("KEYS", {"key1", "key2"});
   EXPECT_TRUE(Execute("return {ARGV[1], KEYS[1], KEYS[2]}"));
   EXPECT_EQ("[str(foo) str(key1) str(key2)]", ser_.res);
+
+  SetGlobalArray("INTKEYS", {"123456", "1"});
+  EXPECT_TRUE(Execute("return INTKEYS[1] + 0")) << error_;
+  EXPECT_EQ("i(123456)", ser_.res);
 }
 
 TEST_F(InterpreterTest, Modules) {
@@ -366,6 +390,131 @@ TEST_F(InterpreterTest, Compatibility) {
 
   // table.setn was removed, resizing is no longer needed, it thows an error
   EXPECT_FALSE(Execute("local t = {}; local a = 1; table.setn(t, 100); return a+123;"));
+}
+
+TEST_F(InterpreterTest, AsyncReplacement) {
+  const string_view kCases[] = {
+      R"(
+      redis.[A]call('INCR', 'A')
+      redis.[A]call('INCR', 'A')
+    )",
+      R"(
+      function test()
+        redis.[A]call('INCR', 'A')
+      end
+    )",
+      R"(
+      local b = redis.call('GET', 'A') + redis.call('GET', 'B')
+    )",
+      R"(
+      if redis.call('EXISTS', 'A') then redis.[A]call('SET', 'B', 1) end
+    )",
+      R"(
+      while redis.call('EXISTS', 'A') do redis.[A]call('SET', 'B', 1) end
+    )",
+      R"(
+      while
+      redis.call('EXISTS', 'A') do
+        print("OK")
+      end
+    )",
+      R"(
+      print(redis.call('GET', 'A'))
+    )",
+      R"(
+      local table = {
+        redis.call('GET', 'A')
+      }
+    )",
+      R"(
+      while true do
+        redis.[A]call('INCR', 'A')
+      end
+    )",
+      R"(
+      if 1 + -- now this is a tricky comment
+        redis.call('GET', 'A')
+        > 0
+      then end
+    )",
+      R"(
+      print('Output'
+      ..
+      redis.call('GET', 'A')
+      )
+    )",
+      R"(
+      while
+      0 < -- we have a comment here unfortunately
+      redis.call('GET', 'A')
+      then end
+    )",
+      R"(
+    while
+    -- we have
+    -- a tricky
+    -- multiline comment
+    redis.call('EXISTS')
+    do end
+    )",
+      R"(
+    --[[ WE SKIP COMMENT BLOCKS FOR NOW ]]
+    redis.call('ECHO', 'TEST')
+    )"};
+
+  for (auto test : kCases) {
+    auto expected = absl::StrReplaceAll(test, {{"[A]", "a"}});
+    auto input = absl::StrReplaceAll(test, {{"[A]", ""}});
+
+    auto result = Interpreter::DetectPossibleAsyncCalls(input);
+    string_view output = result ? *result : input;
+
+    EXPECT_EQ(expected, output);
+  }
+}
+
+TEST_F(InterpreterTest, ReplicateCommands) {
+  EXPECT_TRUE(Execute("return redis.replicate_commands()"));
+  EXPECT_EQ("i(1)", ser_.res);
+  EXPECT_TRUE(Execute("redis.replicate_commands()"));
+  EXPECT_EQ("nil", ser_.res);
+}
+
+TEST_F(InterpreterTest, Log) {
+  EXPECT_TRUE(Execute(R"(redis.log('nonsense', 'nonsense'))"));
+  EXPECT_EQ("nil", ser_.res);
+  EXPECT_TRUE(Execute(R"(redis.log(redis.LOG_WARNING, 'warn'))"));
+  EXPECT_EQ("nil", ser_.res);
+  EXPECT_FALSE(Execute(R"(redis.log(redis.LOG_WARNING))"));
+  EXPECT_THAT(error_, testing::HasSubstr("requires two arguments or more"));
+}
+
+TEST_F(InterpreterTest, Robust) {
+  EXPECT_FALSE(Execute(R"(eval "local a = {}
+      setmetatable(a,{__index=function() foo() end})
+      return a")"));
+  EXPECT_EQ("", ser_.res);
+}
+
+TEST_F(InterpreterTest, Unpack) {
+  auto cb = [](Interpreter::CallArgs ca) {
+    auto* reply = ca.translator;
+    reply->OnInt(1);
+  };
+  intptr_.SetRedisFunc(cb);
+  ASSERT_TRUE(lua_checkstack(lua(), 7000));
+  bool res = Execute(R"(
+local N = 7000
+
+local stringTable = {}
+for i = 1, N do
+    stringTable[i] = "String " .. i
+end
+  return redis.pcall('func', unpack(stringTable))
+)");
+
+  ASSERT_TRUE(res) << error_;
+  EXPECT_EQ("i(1)", ser_.res);
 }
 
 }  // namespace dfly

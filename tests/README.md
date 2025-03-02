@@ -17,6 +17,9 @@ You can override the location of the binary using `DRAGONFLY_PATH` environment v
 - use `--gdb` to start all instances inside gdb.
 - use `--df arg=val` to pass custom arguments to all dragonfly instances. Can be used multiple times.
 - use `--log-seeder file` to store all single-db commands from the lastest tests seeder inside file.
+- use `--existing-port` to use an existing instance for tests instead of starting one
+- use `--rand-seed` to set the global random seed. Makes the seeder predictable.
+- use `--repeat <N>` to run a test multiple times.
 
 for example,
 
@@ -36,7 +39,7 @@ source <virtual env name>/bin/activate
 ```
 Then install all the required dependencies for the tests:
 ```
-pip install -r dragonfly/requirements.txt
+pip3 install -r dragonfly/requirements.txt
 ```
 
 ### Running the tests

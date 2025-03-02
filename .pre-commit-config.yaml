@@ -1,5 +1,11 @@
 default_stages: [commit]
-exclude: 'src\/redis\/.*'
+exclude: |
+    (?x)(
+      src/redis/.* |
+      src/huff/.* |
+      contrib/charts/dragonfly/ci/.* |
+      patches/.*
+    )
 repos:
   - repo: local
     hooks:
@@ -20,3 +26,13 @@ repos:
     hooks:
       - id: clang-format
         name: Clang formatting
+
+  - repo: https://github.com/psf/black
+    rev: 23.7.0
+    hooks:
+      - id: black
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.16.3
+    hooks:
+      - id: gitleaks

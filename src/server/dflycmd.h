@@ -1,4 +1,4 @@
-// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -10,7 +10,7 @@
 #include <memory>
 
 #include "server/conn_context.h"
-#include "util/fibers/fiber.h"
+#include "util/fibers/synchronization.h"
 
 namespace facade {
 class RedisReplyBuilder;
@@ -26,6 +26,30 @@ class EngineShardSet;
 class ServerFamily;
 class RdbSaver;
 class JournalStreamer;
+struct ReplicaRoleInfo;
+struct ReplicationMemoryStats;
+
+// Stores information related to a single flow.
+struct FlowInfo {
+  FlowInfo();
+  ~FlowInfo();
+
+  // Shutdown associated socket if its still open.
+  void TryShutdownSocket();
+
+  facade::Connection* conn = nullptr;
+
+  std::unique_ptr<RdbSaver> saver;            // Saver for full sync phase.
+  std::unique_ptr<JournalStreamer> streamer;  // Streamer for stable sync phase
+  std::string eof_token;
+
+  DflyVersion version = DflyVersion::VER1;
+
+  std::optional<LSN> start_partial_sync_at;
+  uint64_t last_acked_lsn = 0;
+
+  std::function<void()> cleanup;  // Optional cleanup for cancellation.
+};
 
 // DflyCmd is responsible for managing replication. A master instance can be connected
 // to many replica instances, what is more, each of them can open multiple connections.
@@ -46,7 +70,7 @@ class JournalStreamer;
 //    access.
 //
 // Upon first connection from the replica, a new ReplicaInfo is created.
-// It tranistions through the following phases:
+// It transitions through the following phases:
 //  1. Preparation
 //    During this start phase the "flows" are set up - one connection for every master thread. Those
 //    connections registered by the FLOW command sent from each newly opened connection.
@@ -73,138 +97,142 @@ class JournalStreamer;
 //
 class DflyCmd {
  public:
-  // See header comments for state descriptions.
+  // See class comments for state descriptions.
   enum class SyncState { PREPARATION, FULL_SYNC, STABLE_SYNC, CANCELLED };
 
-  // Stores information related to a single flow.
-  struct FlowInfo {
-    FlowInfo();
-    ~FlowInfo();
-    // Shutdown associated socket if its still open.
-    void TryShutdownSocket();
-
-    facade::Connection* conn;
-
-    util::fibers_ext::Fiber full_sync_fb;  // Full sync fiber.
-    std::unique_ptr<RdbSaver> saver;       // Saver used by the full sync phase.
-    std::unique_ptr<JournalStreamer> streamer;
-    std::string eof_token;
-
-    std::function<void()> cleanup;  // Optional cleanup for cancellation.
-  };
-
   // Stores information related to a single replica.
-  struct ReplicaInfo {
+  struct ABSL_LOCKABLE ReplicaInfo {
     ReplicaInfo(unsigned flow_count, std::string address, uint32_t listening_port,
-                Context::ErrHandler err_handler)
-        : state{SyncState::PREPARATION}, cntx{std::move(err_handler)}, address{address},
-          listening_port(listening_port), flows{flow_count} {
+                ExecutionState::ErrHandler err_handler)
+        : replica_state{SyncState::PREPARATION},
+          cntx{std::move(err_handler)},
+          address{std::move(address)},
+          listening_port(listening_port),
+          flows{flow_count} {
     }
 
-    std::atomic<SyncState> state;
-    Context cntx;
+    // Transition into cancelled state, run cleanup.
+    void Cancel();
 
+    SyncState replica_state;  // always guarded by shared_mu
+    ExecutionState cntx;
+
+    std::string id;
     std::string address;
     uint32_t listening_port;
+    DflyVersion version = DflyVersion::VER1;
 
+    // Flows describe the state of shard-local flow.
+    // They are always indexed by the shard index on the master.
     std::vector<FlowInfo> flows;
-    util::fibers_ext::Mutex mu;  // See top of header for locking levels.
-  };
 
-  struct ReplicaRoleInfo {
-    ReplicaRoleInfo(std::string address, uint32_t listening_port, SyncState sync_state);
-    std::string address;
-    uint32_t listening_port;
-    std::string state;
+    util::fb2::SharedMutex shared_mu;  // See top of header for locking levels.
   };
 
  public:
-  DflyCmd(util::ListenerInterface* listener, ServerFamily* server_family);
+  DflyCmd(ServerFamily* server_family);
 
-  void Run(CmdArgList args, ConnectionContext* cntx);
+  void Run(CmdArgList args, Transaction* tx, facade::RedisReplyBuilder* rb,
+           ConnectionContext* cntx);
 
-  void OnClose(ConnectionContext* cntx);
-
-  void BreakOnShutdown();
+  void OnClose(unsigned sync_id);
 
   // Stop all background processes so we can exit in orderly manner.
   void Shutdown();
 
-  // Create new sync session.
-  uint32_t CreateSyncSession(ConnectionContext* cntx);
+  // Create new sync session. Returns (session_id, number of flows)
+  std::pair<uint32_t, unsigned> CreateSyncSession(ConnectionState* state) ABSL_LOCKS_EXCLUDED(mu_);
 
-  std::vector<ReplicaRoleInfo> GetReplicasRoleInfo();
+  // Master side acces method to replication info of that connection.
+  std::shared_ptr<ReplicaInfo> GetReplicaInfoFromConnection(ConnectionState* state);
+
+  // Master-side command. Provides Replica info.
+  std::vector<ReplicaRoleInfo> GetReplicasRoleInfo() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  void GetReplicationMemoryStats(ReplicationMemoryStats* out) const ABSL_NO_THREAD_SAFETY_ANALYSIS;
+
+  // Sets metadata.
+  void SetDflyClientVersion(ConnectionState* state, DflyVersion version);
+
+  // Tries to break those flows that stuck on socket write for too long time.
+  void BreakStalledFlowsInShard() ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
  private:
+  using RedisReplyBuilder = facade::RedisReplyBuilder;
+
   // JOURNAL [START/STOP]
   // Start or stop journaling.
-  void Journal(CmdArgList args, ConnectionContext* cntx);
+  // void Journal(CmdArgList args, ConnectionContext* cntx);
 
   // THREAD [to_thread]
   // Return connection thread index or migrate to another thread.
-  void Thread(CmdArgList args, ConnectionContext* cntx);
+  void Thread(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext* cntx);
 
-  // FLOW <masterid> <syncid> <flowid>
+  // FLOW <masterid> <syncid> <flowid> [<seqid>]
   // Register connection as flow for sync session.
-  void Flow(CmdArgList args, ConnectionContext* cntx);
+  // If seqid is given, it means the client wants to try partial sync.
+  // If it is possible, return Ok and prepare for a partial sync, else
+  // return error and ask the replica to execute FLOW again.
+  void Flow(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext* cntx);
 
   // SYNC <syncid>
   // Initiate full sync.
-  void Sync(CmdArgList args, ConnectionContext* cntx);
+  void Sync(CmdArgList args, Transaction* tx, RedisReplyBuilder* rb);
 
   // STARTSTABLE <syncid>
   // Switch to stable state replication.
-  void StartStable(CmdArgList args, ConnectionContext* cntx);
+  void StartStable(CmdArgList args, Transaction* tx, RedisReplyBuilder* rb);
+
+  // TAKEOVER <syncid>
+  // Shut this master down atomically with replica promotion.
+  void TakeOver(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext* cntx);
 
   // EXPIRE
   // Check all keys for expiry.
-  void Expire(CmdArgList args, ConnectionContext* cntx);
+  void Expire(CmdArgList args, Transaction* tx, RedisReplyBuilder* rb);
 
   // REPLICAOFFSET
   // Return journal records num sent for each flow of replication.
-  void ReplicaOffset(CmdArgList args, ConnectionContext* cntx);
+  void ReplicaOffset(CmdArgList args, RedisReplyBuilder* rb);
+
+  void Load(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext* cntx);
 
   // Start full sync in thread. Start FullSyncFb. Called for each flow.
-  facade::OpStatus StartFullSyncInThread(FlowInfo* flow, Context* cntx, EngineShard* shard);
+  facade::OpStatus StartFullSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
 
   // Stop full sync in thread. Run state switch cleanup.
-  void StopFullSyncInThread(FlowInfo* flow, EngineShard* shard);
+  facade::OpStatus StopFullSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
 
   // Start stable sync in thread. Called for each flow.
-  facade::OpStatus StartStableSyncInThread(FlowInfo* flow, Context* cntx, EngineShard* shard);
-
-  // Fiber that runs full sync for each flow.
-  void FullSyncFb(FlowInfo* flow, Context* cntx);
-
-  // Main entrypoint for stopping replication.
-  void StopReplication(uint32_t sync_id);
-
-  // Transition into cancelled state, run cleanup.
-  void CancelReplication(uint32_t sync_id, std::shared_ptr<ReplicaInfo> replica_info_ptr);
+  void StartStableSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
 
   // Get ReplicaInfo by sync_id.
-  std::shared_ptr<ReplicaInfo> GetReplicaInfo(uint32_t sync_id);
+  std::shared_ptr<ReplicaInfo> GetReplicaInfo(uint32_t sync_id) ABSL_LOCKS_EXCLUDED(mu_);
 
   // Find sync info by id or send error reply.
   std::pair<uint32_t, std::shared_ptr<ReplicaInfo>> GetReplicaInfoOrReply(
-      std::string_view id, facade::RedisReplyBuilder* rb);
+      std::string_view id, facade::RedisReplyBuilder* rb) ABSL_LOCKS_EXCLUDED(mu_);
 
   // Check replica is in expected state and flows are set-up correctly.
   bool CheckReplicaStateOrReply(const ReplicaInfo& ri, SyncState expected,
                                 facade::RedisReplyBuilder* rb);
 
  private:
-  ServerFamily* sf_;
+  // Main entrypoint for stopping replication.
+  void StopReplication(uint32_t sync_id) ABSL_LOCKS_EXCLUDED(mu_);
 
-  util::ListenerInterface* listener_;
-  TxId journal_txid_ = 0;
+  // Return a map between replication ID to lag. lag is defined as the maximum of difference
+  // between the master's LSN and the last acknowledged LSN in over all shards.
+  std::map<uint32_t, LSN> ReplicationLagsLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  ServerFamily* sf_;  // Not owned
 
   uint32_t next_sync_id_ = 1;
 
   using ReplicaInfoMap = absl::btree_map<uint32_t, std::shared_ptr<ReplicaInfo>>;
-  ReplicaInfoMap replica_infos_;
+  ReplicaInfoMap replica_infos_ ABSL_GUARDED_BY(mu_);
 
-  util::fibers_ext::Mutex mu_;  // Guard global operations. See header top for locking levels.
+  mutable util::fb2::Mutex mu_;  // Guard global operations. See header top for locking levels.
 };
 
 }  // namespace dfly

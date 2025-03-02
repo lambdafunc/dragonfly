@@ -3,21 +3,22 @@
 //
 #pragma once
 
+#include <absl/container/inlined_vector.h>
+
 #include <boost/fiber/barrier.hpp>
 #include <queue>
 #include <variant>
 
-#include "base/io_buf.h"
 #include "facade/facade_types.h"
 #include "facade/redis_parser.h"
+#include "io/io_buf.h"
+#include "server/cluster/cluster_defs.h"
 #include "server/common.h"
+#include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
+#include "server/protocol_client.h"
+#include "server/version.h"
 #include "util/fiber_socket_base.h"
-#include "util/fibers/fibers_ext.h"
-
-namespace facade {
-class ReqSerializer;
-};  // namespace facade
 
 namespace dfly {
 
@@ -25,20 +26,19 @@ class Service;
 class ConnectionContext;
 class JournalExecutor;
 struct JournalReader;
+class DflyShardReplica;
 
-class Replica {
+// The attributes of the master we are connecting to.
+struct MasterContext {
+  std::string master_repl_id;
+  std::string dfly_session_id;  // Sync session id for dfly sync.
+  unsigned num_flows = 0;
+  DflyVersion version = DflyVersion::VER1;
+};
+
+// This class manages replication from both Dragonfly and Redis masters.
+class Replica : ProtocolClient {
  private:
-  // The attributes of the master we are connecting to.
-  struct MasterContext {
-    std::string host;
-    uint16_t port;
-    boost::asio::ip::tcp::endpoint endpoint;
-
-    std::string master_repl_id;
-    std::string dfly_session_id;         // Sync session id for dfly sync.
-    uint32_t dfly_flow_id = UINT32_MAX;  // Flow id if replica acts as a dfly flow.
-  };
-
   // The flow is : R_ENABLED -> R_TCP_CONNECTED -> (R_SYNCING) -> R_SYNC_OK.
   // SYNCING means that the initial ack succeeded. It may be optional if we can still load from
   // the journal offset.
@@ -50,75 +50,40 @@ class Replica {
     R_SYNC_OK = 0x10,
   };
 
-  // This class holds the commands of transaction in single shard.
-  // Once all commands recieved the command can be executed.
-  struct TransactionData {
-    // Update the data from ParsedEntry and return true if all shard transaction commands were
-    // recieved.
-    bool AddEntry(journal::ParsedEntry&& entry);
-
-    bool IsGlobalCmd() const;
-
-    static TransactionData FromSingle(journal::ParsedEntry&& entry);
-
-    TxId txid{0};
-    DbIndex dbid{0};
-    uint32_t shard_cnt{0};
-    std::vector<journal::ParsedEntry::CmdData> commands{0};
-    uint32_t journal_rec_count{0};  // Count number of source entries to check offset.
-  };
-
-  // Utility for reading TransactionData from a journal reader.
-  // The journal stream can contain interleaved data for multiple multi transactions,
-  // expiries and out of order executed transactions that need to be grouped on the replica side.
-  struct TransactionReader {
-    std::optional<TransactionData> NextTxData(JournalReader* reader, Context* cntx);
-
-   private:
-    // Stores ongoing multi transaction data.
-    absl::flat_hash_map<TxId, TransactionData> current_;
-  };
-
-  // Coorindator for multi shard execution.
-  struct MultiShardExecution {
-    util::fibers_ext::Mutex map_mu;
-
-    struct TxExecutionSync {
-      util::fibers_ext::Barrier barrier;
-      std::atomic_uint32_t counter;
-      util::fibers_ext::BlockingCounter block;
-
-      TxExecutionSync(uint32_t counter) : barrier(counter), counter(counter), block(counter) {
-      }
-    };
-
-    std::unordered_map<TxId, TxExecutionSync> tx_sync_execution;
-  };
-
  public:
-  Replica(std::string master_host, uint16_t port, Service* se, std::string_view id);
+  Replica(std::string master_host, uint16_t port, Service* se, std::string_view id,
+          std::optional<cluster::SlotRange> slot_range);
   ~Replica();
 
   // Spawns a fiber that runs until link with master is broken or the replication is stopped.
   // Returns true if initial link with master has been established or
   // false if it has failed.
-  bool Start(ConnectionContext* cntx);
+  GenericError Start();
+  void StartMainReplicationFiber();
+
+  // Sets the server state to have replication enabled.
+  // It is like Start(), but does not attempt to establish
+  // a connection right-away, but instead lets MainReplicationFb do the work.
+  void EnableReplication(facade::SinkReplyBuilder* builder);
 
   void Stop();  // thread-safe
 
   void Pause(bool pause);
 
-  std::string_view MasterId() const {
-    return master_context_.master_repl_id;
+  std::error_code TakeOver(std::string_view timeout, bool save_flag);
+
+  bool IsContextCancelled() const {
+    return !cntx_.IsRunning();
   }
 
  private: /* Main standalone mode functions */
   // Coordinate state transitions. Spawned by start.
   void MainReplicationFb();
 
-  std::error_code ResolveMasterDns();  // Resolve master dns
-  std::error_code ConnectAndAuth();    // Connect to master and authenticate if needed.
-  std::error_code Greet();             // Send PING and REPLCONF.
+  std::error_code Greet();  // Send PING and REPLCONF.
+
+  std::error_code HandleCapaDflyResp();
+  std::error_code ConfigureDflyMaster();
 
   std::error_code InitiatePSync();     // Redis full sync.
   std::error_code InitiateDflySync();  // Dragonfly full sync.
@@ -126,34 +91,16 @@ class Replica {
   std::error_code ConsumeRedisStream();  // Redis stable state.
   std::error_code ConsumeDflyStream();   // Dragonfly stable state.
 
-  void CloseSocket();                 // Close replica sockets.
-  void JoinAllFlows();                // Join all flows if possible.
+  void RedisStreamAcksFb();
+
+  // Joins all the flows when doing sharded replication. This is called in two
+  // places: Once at the end of full sync to join the full sync fibers, and twice
+  // if a stable sync is interrupted to join the cancelled stable sync fibers.
+  void JoinDflyFlows();
   void SetShardStates(bool replica);  // Call SetReplica(replica) on all shards.
 
-  // Send DFLY SYNC or DFLY STARTSTABLE if stable is true.
-  std::error_code SendNextPhaseRequest(bool stable);
-
-  void DefaultErrorHandler(const GenericError& err);
-
- private: /* Main dlfly flow mode functions */
-  // Initialize as single dfly flow.
-  Replica(const MasterContext& context, uint32_t dfly_flow_id, Service* service,
-          std::shared_ptr<MultiShardExecution> shared_exe_data);
-
-  // Start replica initialized as dfly flow.
-  std::error_code StartFullSyncFlow(util::fibers_ext::BlockingCounter block, Context* cntx);
-
-  // Transition into stable state mode as dfly flow.
-  std::error_code StartStableSyncFlow(Context* cntx);
-
-  // Single flow full sync fiber spawned by StartFullSyncFlow.
-  void FullSyncDflyFb(std::string eof_token, util::fibers_ext::BlockingCounter block,
-                      Context* cntx);
-
-  // Single flow stable state sync fiber spawned by StartStableSyncFlow.
-  void StableSyncDflyReadFb(Context* cntx);
-
-  void StableSyncDflyExecFb(Context* cntx);
+  // Send DFLY ${kind} to the master instance.
+  std::error_code SendNextPhaseRequest(std::string_view kind);
 
  private: /* Utility */
   struct PSyncResponse {
@@ -163,100 +110,134 @@ class Replica {
     std::variant<std::string, size_t> fullsync;
   };
 
-  // This function uses parser_ and cmd_args_ in order to consume a single response
-  // from the sock_. The output will reside in cmd_str_args_.
-  std::error_code ReadRespReply(base::IoBuf* io_buf, uint32_t* consumed);
-
-  std::error_code ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* header);
-  std::error_code ReadLine(base::IoBuf* io_buf, std::string_view* line);
-
-  std::error_code ParseAndExecute(base::IoBuf* io_buf, ConnectionContext* cntx);
-
-  // Check if reps_args contains a simple reply.
-  bool CheckRespIsSimpleReply(std::string_view reply) const;
-
-  // Check resp_args contains the following types at front.
-  bool CheckRespFirstTypes(std::initializer_list<facade::RespExpr::Type> types) const;
-
-  // Send command, update last_io_time, return error.
-  std::error_code SendCommand(std::string_view command, facade::ReqSerializer* serializer);
-
-  void ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context* cntx);
-  void InsertTxDataToShardResource(TransactionData&& tx_data);
-  void ExecuteTxWithNoShardSync(TransactionData&& tx_data, Context* cntx);
-  bool InsertTxToSharedMap(const TransactionData& tx_data);
+  std::error_code ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* dest);
 
  public: /* Utility */
-  struct Info {
+  struct Summary {
     std::string host;
     uint16_t port;
     bool master_link_established;
-    bool sync_in_progress;      // snapshot sync.
+    bool full_sync_in_progress;
+    bool full_sync_done;
     time_t master_last_io_sec;  // monotonic clock.
+    std::string master_id;
+    uint32_t reconnect_count;
+
+    // sum of the offsets on all the flows.
+    uint64_t repl_offset_sum;
   };
 
-  Info GetInfo() const;  // thread-safe, blocks fiber
+  Summary GetSummary() const;  // thread-safe, blocks fiber, makes a hop.
 
   bool HasDflyMaster() const {
     return !master_context_.dfly_session_id.empty();
-  }
-
-  bool IsDflyFlow() const {
-    return master_context_.dfly_flow_id != UINT32_MAX;
-  }
-
-  const std::string& MasterHost() const {
-    return master_context_.host;
-  }
-
-  uint16_t Port() const {
-    return master_context_.port;
   }
 
   std::vector<uint64_t> GetReplicaOffset() const;
   std::string GetSyncId() const;
 
  private:
+  util::fb2::ProactorBase* proactor_ = nullptr;
   Service& service_;
   MasterContext master_context_;
-  std::unique_ptr<util::LinuxSocketBase> sock_;
 
+  // In redis replication mode.
+  util::fb2::Fiber sync_fb_;
+  util::fb2::Fiber acks_fb_;
+  util::fb2::EventCount replica_waker_;
+
+  std::vector<std::unique_ptr<DflyShardReplica>> shard_flows_;
+  std::vector<std::vector<unsigned>> thread_flow_map_;  // a map from proactor id to flow list.
+
+  // A vector of the last executer LSNs when a replication is interrupted.
+  // Allows partial sync on reconnects.
+  std::optional<std::vector<LSN>> last_journal_LSNs_;
   std::shared_ptr<MultiShardExecution> multi_shard_exe_;
 
-  std::queue<std::pair<TransactionData, bool>> trans_data_queue_;
-  static constexpr size_t kYieldAfterItemsInQueue = 50;
-  ::util::fibers_ext::EventCount waker_;  // waker for trans_data_queue_
-  bool use_multi_shard_exe_sync_;
-
-  std::unique_ptr<JournalExecutor> executor_;
-  // Count the number of journal records executed in specific flow
-  std::atomic_uint64_t journal_rec_executed_ = 0;
-
-  // MainReplicationFb in standalone mode, FullSyncDflyFb in flow mode.
-  ::util::fibers_ext::Fiber sync_fb_;
-  ::util::fibers_ext::Fiber execution_fb_;
-
-  std::vector<std::unique_ptr<Replica>> shard_flows_;
-
   // Guard operations where flows might be in a mixed state (transition/setup)
-  util::fibers_ext::Mutex flows_op_mu_;
-
-  std::optional<base::IoBuf> leftover_buf_;
-  std::unique_ptr<facade::RedisParser> parser_;
-  facade::RespVec resp_args_;
-  facade::CmdArgVec cmd_str_args_;
-
-  Context cntx_;  // context for tasks in replica.
+  util::fb2::Mutex flows_op_mu_;
 
   // repl_offs - till what offset we've already read from the master.
   // ack_offs_ last acknowledged offset.
   size_t repl_offs_ = 0, ack_offs_ = 0;
-  uint64_t last_io_time_ = 0;  // in ns, monotonic clock.
-  unsigned state_mask_ = 0;
-  unsigned num_df_flows_ = 0;
+  std::atomic<unsigned> state_mask_ = 0;
 
   bool is_paused_ = false;
   std::string id_;
+
+  std::optional<cluster::SlotRange> slot_range_;
+
+  uint32_t reconnect_count_ = 0;
+};
+
+class RdbLoader;
+// This class implements a single shard replication flow from a Dragonfly master instance.
+// Multiple DflyShardReplica objects are managed by a Replica object.
+class DflyShardReplica : public ProtocolClient {
+ public:
+  DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
+                   Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe);
+  ~DflyShardReplica();
+
+  void Cancel();
+  void JoinFlow();
+
+  // Start replica initialized as dfly flow.
+  // Sets is_full_sync when successful.
+  io::Result<bool> StartSyncFlow(util::fb2::BlockingCounter block, ExecutionState* cntx,
+                                 std::optional<LSN>);
+
+  // Transition into stable state mode as dfly flow.
+  std::error_code StartStableSyncFlow(ExecutionState* cntx);
+
+  // Single flow full sync fiber spawned by StartFullSyncFlow.
+  void FullSyncDflyFb(std::string eof_token, util::fb2::BlockingCounter block,
+                      ExecutionState* cntx);
+
+  // Single flow stable state sync fiber spawned by StartStableSyncFlow.
+  void StableSyncDflyReadFb(ExecutionState* cntx);
+
+  void StableSyncDflyAcksFb(ExecutionState* cntx);
+
+  void ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx);
+
+  uint32_t FlowId() const;
+
+  uint64_t JournalExecutedCount() const {
+    return journal_rec_executed_.load(std::memory_order_relaxed);
+  }
+
+  // Can be called from any thread.
+  void Pause(bool pause);
+
+ private:
+  Service& service_;
+  MasterContext master_context_;
+
+  std::optional<base::IoBuf> leftover_buf_;
+
+  util::fb2::EventCount shard_replica_waker_;  // waker for trans_data_queue_
+
+  std::unique_ptr<JournalExecutor> executor_;
+  std::unique_ptr<RdbLoader> rdb_loader_;
+
+  // The master instance has a LSN for each journal record. This counts
+  // the number of journal records executed in this flow plus the initial
+  // journal offset that we received in the transition from full sync
+  // to stable sync.
+  // Note: This is not 1-to-1 the LSN in the master, because this counts
+  // **executed** records, which might be received interleaved when commands
+  // run out-of-order on the master instance.
+  // Atomic, because JournalExecutedCount() can be called from any thread.
+  std::atomic_uint64_t journal_rec_executed_ = 0;
+
+  util::fb2::Fiber sync_fb_, acks_fb_;
+  size_t ack_offs_ = 0;
+  int proactor_index_ = -1;
+  bool force_ping_ = false;
+
+  std::shared_ptr<MultiShardExecution> multi_shard_exe_;
+  uint32_t flow_id_ = UINT32_MAX;  // Flow id if replica acts as a dfly flow.
 };
 
 }  // namespace dfly

@@ -5,14 +5,18 @@
 
 #include <absl/container/flat_hash_map.h>
 
-#include <boost/fiber/mutex.hpp>
 #include <string_view>
 
+#include "facade/dragonfly_connection.h"
 #include "server/conn_context.h"
 
 namespace dfly {
 
 class ChannelStoreUpdater;
+
+namespace cluster {
+class SlotSet;
+}
 
 // ChannelStore manages PUB/SUB subscriptions.
 //
@@ -40,32 +44,35 @@ class ChannelStore {
   friend class ChannelStoreUpdater;
 
  public:
-  struct Subscriber {
-    Subscriber(ConnectionContext* cntx, uint32_t tid);
-    Subscriber(uint32_t tid);
-
-    Subscriber(Subscriber&&) noexcept = default;
-    Subscriber& operator=(Subscriber&&) noexcept = default;
-
-    Subscriber(const Subscriber&) = delete;
-    void operator=(const Subscriber&) = delete;
+  struct Subscriber : public facade::Connection::WeakRef {
+    Subscriber(WeakRef ref, const std::string& pattern)
+        : facade::Connection::WeakRef(std::move(ref)), pattern(pattern) {
+    }
 
     // Sort by thread-id. Subscriber without owner comes first.
     static bool ByThread(const Subscriber& lhs, const Subscriber& rhs);
+    static bool ByThreadId(const Subscriber& lhs, const unsigned thread);
 
-    ConnectionContext* conn_cntx;
-    util::fibers_ext::BlockingCounter borrow_token;  // to keep connection alive
-    uint32_t thread_id;
     std::string pattern;  // non-empty if registered via psubscribe
   };
 
   ChannelStore();
 
+  // Send messages to channel, block on connection backpressure
+  unsigned SendMessages(std::string_view channel, facade::ArgRange messages) const;
+
   // Fetch all subscribers for channel, including matching patterns.
   std::vector<Subscriber> FetchSubscribers(std::string_view channel) const;
 
   std::vector<std::string> ListChannels(const std::string_view pattern) const;
+
   size_t PatternCount() const;
+
+  void UnsubscribeAfterClusterSlotMigration(const cluster::SlotSet& deleted_slots);
+
+  using ChannelsSubMap =
+      absl::flat_hash_map<std::string_view, std::vector<ChannelStore::Subscriber>>;
+  void UnsubscribeConnectionsFromDeletedSlots(const ChannelsSubMap& sub_map, uint32_t idx);
 
   // Destroy current instance and delete it.
   static void Destroy();
@@ -88,7 +95,7 @@ class ChannelStore {
     SubscribeMap* Get() const;
     void Set(SubscribeMap* sm);
 
-    SubscribeMap* operator->();
+    SubscribeMap* operator->() const;
     const SubscribeMap& operator*() const;
 
    private:
@@ -107,7 +114,7 @@ class ChannelStore {
   // Centralized controller to prevent overlaping updates.
   struct ControlBlock {
     std::atomic<ChannelStore*> most_recent;
-    ::boost::fibers::mutex update_mu;  // locked during updates.
+    util::fb2::Mutex update_mu;  // locked during updates.
   };
 
  private:
@@ -131,6 +138,12 @@ class ChannelStoreUpdater {
 
   void Record(std::string_view key);
   void Apply();
+
+  // Used for cluster when slots migrate. We need to:
+  // 1. Remove the channel from the copy.
+  // 2. Unsuscribe all the connections from each channel.
+  // 3. Update the control block pointer.
+  void ApplyAndUnsubscribe();
 
  private:
   using ChannelMap = ChannelStore::ChannelMap;

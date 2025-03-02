@@ -8,8 +8,16 @@ metadata:
   labels:
     app.kubernetes.io/name: dragonfly
     app.kubernetes.io/instance: test
-    app.kubernetes.io/version: "v1.0.0"
+    app.kubernetes.io/version: "v1.27.1"
     app.kubernetes.io/managed-by: Helm
+---
+# Source: dragonfly/templates/extra-manifests.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dfly-password
+stringData:
+  password: foobar
 ---
 # Source: dragonfly/templates/tls-secret.yaml
 apiVersion: v1
@@ -20,7 +28,7 @@ metadata:
   labels:
     app.kubernetes.io/name: dragonfly
     app.kubernetes.io/instance: test
-    app.kubernetes.io/version: "v1.0.0"
+    app.kubernetes.io/version: "v1.27.1"
     app.kubernetes.io/managed-by: Helm
 type: kubernetes.io/tls
 data:
@@ -36,7 +44,7 @@ metadata:
   labels:
     app.kubernetes.io/name: dragonfly
     app.kubernetes.io/instance: test
-    app.kubernetes.io/version: "v1.0.0"
+    app.kubernetes.io/version: "v1.27.1"
     app.kubernetes.io/managed-by: Helm
 spec:
   type: ClusterIP
@@ -58,7 +66,7 @@ metadata:
   labels:
     app.kubernetes.io/name: dragonfly
     app.kubernetes.io/instance: test
-    app.kubernetes.io/version: "v1.0.0"
+    app.kubernetes.io/version: "v1.27.1"
     app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
@@ -69,7 +77,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/tls-secret: 2e843eef2052b7a20425e3de9a33e6b3beedd11fbec8df47a1566a8c7c48479d
+        checksum/tls-secret: 76fe0466d48a505c96d9dfaa61fcc56538b2539df22df9d0cf9f8e534bc36f19
       labels:
         app.kubernetes.io/name: dragonfly
         app.kubernetes.io/instance: test
@@ -77,7 +85,7 @@ spec:
       serviceAccountName: test-dragonfly
       containers:
         - name: dragonfly
-          image: "docker.dragonflydb.io/dragonflydb/dragonfly:v1.0.0"
+          image: "docker.dragonflydb.io/dragonflydb/dragonfly:v1.27.1"
           imagePullPolicy: IfNotPresent
           ports:
             - name: dragonfly
@@ -114,6 +122,12 @@ spec:
           volumeMounts:
             - mountPath: /etc/dragonfly/tls
               name: tls
+          env:
+            - name: DFLY_requirepass
+              valueFrom:
+                secretKeyRef:
+                  name: dfly-password
+                  key: password
       volumes:
         - name: tls
           secret:
